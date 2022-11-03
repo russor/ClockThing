@@ -1,7 +1,7 @@
 # ClockThing
 > An Arduino Alarm Clock for LILYGO LILY Pi ESP32
 
-ClockThing lets you have a clock that's uses NTP to set the time, and (almost) fetches iCal feeds to handle timezones and when to alarm.
+ClockThing lets you have a clock that uses NTP to set the time, and (almost) fetches iCal feeds to handle timezones and when to alarm.
 
 Current interim version fetches a custom feed generated from an iCal feed. The feed format looks like this:
 
