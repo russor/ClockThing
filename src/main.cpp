@@ -224,7 +224,7 @@ lv_style_t my_style, time_style, date_style, alarm_style;
 
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
   preferences.begin("clock", false, NULL);
   if (preferences.getBytes("s", &state, sizeof(state)))
   {
@@ -236,17 +236,6 @@ void setup()
     Serial.println("no saved data");
     bzero(&state, sizeof(state));
   }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.onEvent(andevent);
-  // wifiManager.resetSettings();
-  wifiManager.addParameter(&feed_url);
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.setSaveConfigCallback(saveParamsCallback);
-  wifiManager.setBreakAfterConfig(true);
-  if (wifiManager.autoConnect())
-  {
-  };
 
   // Get watch instance
   ttgo = TTGOClass::getWatch();
@@ -337,19 +326,23 @@ void setup()
   lv_obj_set_pos(alarmlabel, 0, 282);
 
   warninglabel = lv_label_create(lv_scr_act(), NULL);
-  lv_obj_set_pos(warninglabel, 350, 289);
-
-  wifilabel = lv_label_create(lv_scr_act(), NULL);
-  lv_obj_set_pos(wifilabel, 380, 289);
-
-  ntplabel = lv_label_create(lv_scr_act(), NULL);
-  lv_obj_set_pos(ntplabel, 420, 289);
-
-  icallabel = lv_label_create(lv_scr_act(), NULL);
-  lv_obj_set_pos(icallabel, 450, 289);
+  lv_obj_set_pos(warninglabel, 480, 289);
 
   ttgo->button->setClickHandler(clicked);
   ttgo->button->setLongClickHandler(longclicked);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.onEvent(andevent);
+  // wifiManager.resetSettings();
+  wifiManager.addParameter(&feed_url);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setSaveConfigCallback(saveParamsCallback);
+  wifiManager.setBreakAfterConfig(true);
+  if (wifiManager.autoConnect())
+  {
+  };
+
+  Serial.println("end of setup");
 }
 
 const char *months[12] = {
@@ -567,15 +560,17 @@ void loop()
       lv_label_set_text_static(amlabel, "AM");
     }
 
-    int dayofweek = t->tm_wday; // ttgo->rtc->getDayOfWeek(t->tm_day, t->tm_month + 1, t->tm_year + 1900);
+    int dayofweek = t->tm_wday;
     lv_label_set_text_fmt(datelabel, "%s %s %d, %d", weekdays[dayofweek], months[t->tm_mon], t->tm_mday, t->tm_year + 1900);
+
+    String alarm_prefix = "";
 
     if (found_alarm)
     {
       next_alarm = altime;
       if (state.alarm_skip && state.alarm_skip != next_alarm)
       {
-        Serial.printf("unset skip %d != %d\n", state.alarm_skip, next_alarm);
+        Serial.printf("unset skip %ld != %ld\n", state.alarm_skip, next_alarm);
         state.alarm_skip = 0;
         save_data("unset skip");
       }
@@ -608,47 +603,52 @@ void loop()
       }
       if (beeping)
       {
-        lv_label_set_text_fmt(alarmlabel, LV_SYMBOL_EYE_OPEN " %d:%02d %s %s",
-                              t->tm_hour, t->tm_min, ampm, state.alarms[al].buffer);
+        alarm_prefix = LV_SYMBOL_EYE_OPEN;
       }
       else if (alarm_now != last_alarm && next_alarm != state.alarm_skip)
       {
-        lv_label_set_text_fmt(alarmlabel, LV_SYMBOL_BELL " %d:%02d %s %s",
-                              t->tm_hour, t->tm_min, ampm, state.alarms[al].buffer);
+        alarm_prefix = LV_SYMBOL_BELL;
       }
       else
       {
-        lv_label_set_text_fmt(alarmlabel, LV_SYMBOL_PAUSE " %d:%02d %s %s",
-                              t->tm_hour, t->tm_min, ampm, state.alarms[al].buffer);
+        alarm_prefix = LV_SYMBOL_PAUSE;
       }
+
+      lv_label_set_text_fmt(alarmlabel, "%s %d:%02d %s %s", alarm_prefix.c_str(),
+                            t->tm_hour, t->tm_min, ampm, state.alarms[al].buffer);
     }
     else
     {
-      state.alarm_skip = next_alarm = 0;
-      save_data("no imminent alarm");
+      if (state.alarm_skip != 0 && next_alarm != 0)
+      {
+        state.alarm_skip = next_alarm = 0;
+        save_data("no imminent alarm");
+      }
       lv_label_set_text_static(alarmlabel, "no imminent alarm");
     }
 
     int warn = 0;
 
+    String warning_text = "";
+
     if (WiFi.status() != WL_CONNECTED)
     {
-      lv_label_set_text(wifilabel, LV_SYMBOL_WIFI);
+      warning_text += LV_SYMBOL_WIFI;
       warn = 1;
-    }
-    else
-    {
-      lv_label_set_text_static(wifilabel, "");
+      if (!beeping && t->tm_sec >= 10 && t->tm_sec < 20)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s Wi-Fi Disconnected", alarm_prefix.c_str());
+      }
     }
 
     if (now - last_synced > (3600 * 2))
     {
-      lv_label_set_text(ntplabel, LV_SYMBOL_REFRESH);
+      warning_text += LV_SYMBOL_REFRESH;
       warn = 1;
-    }
-    else
-    {
-      lv_label_set_text(ntplabel, "");
+      if (!beeping && t->tm_sec >= 20 && t->tm_sec < 30)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s no recent NTP sync", alarm_prefix.c_str());
+      }
     }
 
     if (warn == 0 && now - last_fetched > 60 * 60)
@@ -658,29 +658,48 @@ void loop()
 
     if (now - last_success > (3600 * 4))
     {
-      lv_label_set_text(icallabel, LV_SYMBOL_BELL);
+      warning_text += LV_SYMBOL_BELL;
       warn = 1;
-    }
-    else
-    {
-      lv_label_set_text(icallabel, "");
+      if (!beeping && t->tm_sec >= 30 && t->tm_sec < 40)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s no recent iCal sync", alarm_prefix.c_str());
+      }
     }
 
     if (warn)
     {
-      lv_label_set_text(warninglabel, LV_SYMBOL_WARNING);
+      warning_text = LV_SYMBOL_WARNING + warning_text;
     }
-    else
+
+    if (wifiManager.getWebPortalActive())
     {
-      lv_label_set_text(warninglabel, "");
+      warning_text += LV_SYMBOL_SETTINGS;
+      if (!beeping && t->tm_sec >= 40 && t->tm_sec < 50)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getWiFiSSID().c_str());
+        lv_label_set_text_fmt(datelabel, "http://%s", WiFi.localIP().toString().c_str());
+      }
     }
+
+    if (wifiManager.getConfigPortalActive())
+    {
+      if (!beeping)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getConfigPortalSSID().c_str());
+        lv_label_set_text_fmt(datelabel, "http://%s", WiFi.softAPIP().toString().c_str());
+        warning_text = "";
+      }
+    }
+
+    lv_label_set_text(warninglabel, warning_text.c_str());
+    lv_obj_set_pos(warninglabel, 480 - ((warning_text.length() / 3) * 30), 289);
 
     ticked = 0;
     lasttime = now;
     lv_task_handler();
   }
 
-  delay(5);
+  vTaskDelay(5);
   ttgo->button->loop();
   if (ttgo->touched())
   {
