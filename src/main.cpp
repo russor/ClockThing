@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <esp_sntp.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+#include <uICal.h>
 
 //#define ALARM_FREQ 500
 #define ALARM_FREQ 1046
@@ -22,6 +23,8 @@ time_t last_touch;
 time_t last_alarm;
 time_t next_alarm;
 
+#define MAX_ALARMS 100
+
 struct
 {
   struct
@@ -34,12 +37,13 @@ struct
   struct
   {
     time_t start;
-    unsigned char buffer[20];
-  } alarms[100];
+    unsigned char name[20];
+  } alarms[MAX_ALARMS];
   size_t num_alarms;
   time_t alarm_skip;
   char feed_url[256];
 } state;
+
 Preferences preferences;
 
 WiFiManager wifiManager;
@@ -47,36 +51,6 @@ WiFiManagerParameter feed_url("feed", "ical feed url", "", 255);
 
 volatile int touched = 0;
 volatile int beeping = 0;
-
-void relayTurnOn(void)
-{
-  ttgo->turnOnRelay();
-}
-
-void relayTurnOff(void)
-{
-  ttgo->turnOffRelay();
-}
-
-void setBrightness(uint8_t level)
-{
-  ttgo->setBrightness(level);
-}
-
-void turnOnUSB()
-{
-  ttgo->turnOnUSB();
-}
-
-void turnOffUSB()
-{
-  ttgo->turnOffUSB();
-}
-
-float getVoltage()
-{
-  return ttgo->getVoltage();
-}
 
 void time_synced(struct timeval *tv)
 {
@@ -338,19 +312,10 @@ void setup()
   wifiManager.setConfigPortalBlocking(false);
   wifiManager.setSaveConfigCallback(saveParamsCallback);
   wifiManager.setBreakAfterConfig(true);
-  if (wifiManager.autoConnect())
-  {
-  };
-
+  wifiManager.autoConnect();
+  
   Serial.println("end of setup");
 }
-
-const char *months[12] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-const char *weekdays[7] = {
-    "Sun", "Mon", "Tue", "Wed", "Thr", "Fri", "Sat"};
-
-char buffer[80] = {0};
 
 time_t lasttime = 0;
 
@@ -382,7 +347,34 @@ void try_fetch()
     return;
   }
 
-  String payload = https.getString();
+  uICAL::Calendar_ptr cal = nullptr;
+  try
+  {
+    uICAL::istream_Stream istm(https.getStream());
+    cal = uICAL::Calendar::load(istm);
+
+    uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
+
+    uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
+    int alarm = 0;
+    while (calIt->next() && alarm < MAX_ALARMS)
+    {
+      uICAL::CalendarEntry_ptr entry = calIt->current();
+      state.alarms[alarm].start = entry->start().seconds();
+      entry->summary().getBytes(state.alarms[alarm].name, sizeof(state.alarms[alarm].name) - 1);
+      ++alarm;
+      state.num_alarms = alarm;
+      last_success = time(NULL);
+    }
+  }
+  catch (uICAL::Error ex)
+  {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s: %s", ex.message.c_str(), "! Failed loading calendar");
+    Serial.println(buf);
+  }
+
+  /*String payload = https.getString();
   int start = 0;
   int offs = 0;
   int als = 0;
@@ -458,7 +450,7 @@ void try_fetch()
 
     // Serial.println(line);
     start = e + 1;
-  }
+  } */
   save_data("try fetch");
 }
 
@@ -485,7 +477,7 @@ void loop()
     time_t altime;
     for (; al < state.num_alarms; ++al)
     {
-      if (state.alarms[al].start >= alarm_now && state.alarms[al].start < alarm_now + (3600 * 22))
+      if (state.alarms[al].start >= alarm_now && state.alarms[al].start < alarm_now + (7 * 86400))
       {
         altime = state.alarms[al].start;
         if (altime == alarm_now && last_alarm != alarm_now)
@@ -527,29 +519,16 @@ void loop()
     {
       lv_label_set_text_static(tzlabel, "UTC");
     }
-    char tens = '!';
-    bool ispm = false;
 
-    if (t->tm_hour == 0)
+    char buffer[80] = {0};
+    strftime(buffer, sizeof(buffer), "%I:%M", t);
+    if (buffer[0] == '0')
     {
-      t->tm_hour = 12;
-    }
-    else if (t->tm_hour == 12)
-    {
-      ispm = true;
-    }
-    else if (t->tm_hour > 12)
-    {
-      t->tm_hour -= 12;
-      ispm = true;
-    }
-    if (t->tm_hour >= 10)
-    {
-      tens = '1';
+      buffer[0] = '!';
     }
 
-    lv_label_set_text_fmt(timelabel, "%c%01d:%02d", tens, t->tm_hour % 10, t->tm_min);
-    if (ispm)
+    lv_label_set_text(timelabel, buffer);
+    if (t->tm_hour >= 12)
     {
       lv_label_set_text_static(pmlabel, "PM");
       lv_label_set_text_static(amlabel, "");
@@ -560,8 +539,8 @@ void loop()
       lv_label_set_text_static(amlabel, "AM");
     }
 
-    int dayofweek = t->tm_wday;
-    lv_label_set_text_fmt(datelabel, "%s %s %d, %d", weekdays[dayofweek], months[t->tm_mon], t->tm_mday, t->tm_year + 1900);
+    strftime(buffer, sizeof(buffer), "%a %b %e, %Y", t);
+    lv_label_set_text(datelabel, buffer);
 
     String alarm_prefix = "";
 
@@ -584,23 +563,6 @@ void loop()
         altime += state.offsets[offset].offset;
       }
 
-      t = gmtime(&altime);
-      static char am[3] = "AM";
-      static char pm[3] = "PM";
-      char *ampm = am;
-      if (t->tm_hour == 0)
-      {
-        t->tm_hour = 12;
-      }
-      else if (t->tm_hour == 12)
-      {
-        ampm = pm;
-      }
-      else if (t->tm_hour > 12)
-      {
-        t->tm_hour -= 12;
-        ampm = pm;
-      }
       if (beeping)
       {
         alarm_prefix = LV_SYMBOL_EYE_OPEN;
@@ -614,8 +576,17 @@ void loop()
         alarm_prefix = LV_SYMBOL_PAUSE;
       }
 
-      lv_label_set_text_fmt(alarmlabel, "%s %d:%02d %s %s", alarm_prefix.c_str(),
-                            t->tm_hour, t->tm_min, ampm, state.alarms[al].buffer);
+      t = gmtime(&altime);
+      if (next_alarm < alarm_now + (3600 * 22))
+      {
+        strftime(buffer, sizeof(buffer), "%l:%M %p", t);
+      }
+      else
+      {
+        strftime(buffer, sizeof(buffer), "%a %l:%M %p", t);
+      }
+
+      lv_label_set_text_fmt(alarmlabel, "%s %s %s", alarm_prefix.c_str(), buffer, state.alarms[al].name);
     }
     else
     {
