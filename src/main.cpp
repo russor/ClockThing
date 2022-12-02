@@ -7,7 +7,9 @@
 #include <Preferences.h>
 #include <esp_sntp.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+#include <climits>
 #include <uICal.h>
+#include <tuple>
 
 //#define ALARM_FREQ 500
 #define ALARM_FREQ 1046
@@ -23,6 +25,7 @@ time_t last_touch;
 time_t last_alarm;
 time_t next_alarm;
 
+#define MAX_OFFSETS 4
 #define MAX_ALARMS 100
 
 struct
@@ -32,7 +35,7 @@ struct
     time_t start;
     uint32_t offset;
     unsigned char buffer[8];
-  } offsets[4];
+  } offsets[MAX_OFFSETS];
   size_t num_offsets;
   struct
   {
@@ -313,7 +316,7 @@ void setup()
   wifiManager.setSaveConfigCallback(saveParamsCallback);
   wifiManager.setBreakAfterConfig(true);
   wifiManager.autoConnect();
-  
+
   Serial.println("end of setup");
 }
 
@@ -353,6 +356,27 @@ void try_fetch()
     uICAL::istream_Stream istm(https.getStream());
     cal = uICAL::Calendar::load(istm);
 
+    auto current_offset = cal->tz()->fromUTC(last_fetched);
+
+    state.offsets[0].start = last_fetched;
+    state.offsets[0].offset = std::get<0>(current_offset) - last_fetched;
+    std::get<1>(current_offset).getBytes(state.offsets[0].buffer, sizeof(state.offsets[0].buffer) - 1);
+    int offsets = 1;
+    while (offsets < MAX_OFFSETS)
+    {
+      auto next_offset = cal->tz()->next_transition_UTC(state.offsets[offsets - 1].start);
+      if (std::get<0>(next_offset) == MAX_UICAL_SECONDS)
+      {
+        break;
+      }
+      state.offsets[offsets].start = std::get<0>(next_offset);
+      state.offsets[offsets].offset = std::get<1>(next_offset);
+    std:
+      std::get<2>(next_offset).getBytes(state.offsets[offsets].buffer, sizeof(state.offsets[0].buffer) - 1);
+      ++offsets;
+    }
+    state.num_offsets = offsets;
+
     uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
 
     uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
@@ -373,84 +397,6 @@ void try_fetch()
     snprintf(buf, sizeof(buf), "%s: %s", ex.message.c_str(), "! Failed loading calendar");
     Serial.println(buf);
   }
-
-  /*String payload = https.getString();
-  int start = 0;
-  int offs = 0;
-  int als = 0;
-  while (start < payload.length())
-  {
-    int e = payload.indexOf('\n', start);
-    if (e == -1)
-    {
-      e = payload.length();
-    }
-    String line = payload.substring(start, e);
-    int x = payload.indexOf('\t', start);
-    if (x == -1 || x >= e)
-    {
-      Serial.println("bad tag");
-      return;
-    }
-    String tmp = payload.substring(start, x);
-    if (tmp.equals("TZ") && offs < (sizeof(state.offsets) / sizeof(state.offsets[0])))
-    {
-      start = x + 1;
-      x = payload.indexOf('\t', start);
-      if (x == -1 || x >= e)
-      {
-        Serial.println("bad TZ");
-        return;
-      }
-      time_t start_time = payload.substring(start, x).toInt();
-      start = x + 1;
-      x = payload.indexOf('\t', start);
-      if (x == -1 || x >= e)
-      {
-        Serial.println("bad TZ");
-        return;
-      }
-      uint32_t offset = payload.substring(start, x).toInt();
-      start = x + 1;
-      state.offsets[offs].start = start_time;
-      state.offsets[offs].offset = offset;
-      payload.substring(start, e).getBytes(state.offsets[offs].buffer, sizeof(state.offsets[offs].buffer) - 1);
-      ++offs;
-      state.num_offsets = offs;
-    }
-    else if (tmp.equals("ALARM") && state.num_alarms < (sizeof(state.alarms) / sizeof(state.alarms[0])))
-    {
-      start = x + 1;
-      x = payload.indexOf('\t', start);
-      if (x == -1 || x >= e)
-      {
-        Serial.println("bad ALARM");
-        return;
-      }
-      time_t start_time = payload.substring(start, x).toInt();
-      if (start_time >= last_fetched)
-      {
-        state.alarms[als].start = start_time - (start_time % 60); // fold alarms to minutes
-        start = x + 1;
-        payload.substring(start, e).getBytes(state.alarms[als].buffer, sizeof(state.alarms[als].buffer) - 1);
-        ++als;
-        state.num_alarms = als;
-      }
-    }
-    else if (tmp.equals("COMPLETE"))
-    {
-      start = x + 1;
-      time_t complete_time = payload.substring(start, e).toInt();
-      state.num_alarms = als;
-      if (last_fetched - 86400 < complete_time && last_fetched + 86400 > complete_time)
-      {
-        last_success = time(NULL);
-      }
-    }
-
-    // Serial.println(line);
-    start = e + 1;
-  } */
   save_data("try fetch");
 }
 
