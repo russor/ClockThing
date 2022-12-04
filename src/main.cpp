@@ -9,6 +9,7 @@
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <climits>
 #include <uICal.h>
+#include <uICAL/veventiter.h>
 #include <tuple>
 
 //#define ALARM_FREQ 500
@@ -24,6 +25,7 @@ time_t last_success;
 time_t last_touch;
 time_t last_alarm;
 time_t next_alarm;
+int want_stop = 0;
 
 #define MAX_OFFSETS 4
 #define MAX_ALARMS 100
@@ -116,7 +118,7 @@ void saveParamsCallback()
     }
     save_data("save params callback");
   }
-  wifiManager.stopWebPortal();
+  want_stop = 1;
 }
 
 TaskHandle_t beeptask;
@@ -192,6 +194,7 @@ void longclicked()
     return clicked();
   }
   wifiManager.startWebPortal();
+  want_stop = 0;
 }
 
 lv_obj_t *timelabel, *datelabel, *alarmlabel, *tzlabel, *amlabel, *pmlabel;
@@ -315,7 +318,10 @@ void setup()
   wifiManager.setConfigPortalBlocking(false);
   wifiManager.setSaveConfigCallback(saveParamsCallback);
   wifiManager.setBreakAfterConfig(true);
-  wifiManager.autoConnect();
+  if (!wifiManager.autoConnect())
+  {
+    want_stop = 0;
+  };
 
   Serial.println("end of setup");
 }
@@ -332,6 +338,8 @@ void try_fetch()
     return;
   }
   HTTPClient https;
+  https.useHTTP10(true);
+
   if (!https.begin(state.feed_url))
   {
     Serial.println("https begin failed");
@@ -353,8 +361,13 @@ void try_fetch()
   uICAL::Calendar_ptr cal = nullptr;
   try
   {
+    uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
     uICAL::istream_Stream istm(https.getStream());
-    cal = uICAL::Calendar::load(istm);
+    cal = uICAL::Calendar::load(istm, [calBegin, calEnd](const uICAL::VEvent &event)
+                                {
+        auto ev = uICAL::new_ptr<uICAL::VEvent>(event);
+        auto evIt = uICAL::new_ptr<uICAL::VEventIter>(ev, calBegin, calEnd);
+        return evIt->next(); });
 
     auto current_offset = cal->tz()->fromUTC(last_fetched);
 
@@ -376,8 +389,6 @@ void try_fetch()
       ++offsets;
     }
     state.num_offsets = offsets;
-
-    uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
 
     uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
     int alarm = 0;
@@ -590,11 +601,18 @@ void loop()
 
     if (wifiManager.getWebPortalActive())
     {
-      warning_text += LV_SYMBOL_SETTINGS;
-      if (!beeping && t->tm_sec >= 40 && t->tm_sec < 50)
+      if (want_stop)
       {
-        lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getWiFiSSID().c_str());
-        lv_label_set_text_fmt(datelabel, "http://%s", WiFi.localIP().toString().c_str());
+        wifiManager.stopWebPortal();
+      }
+      else
+      {
+        warning_text += LV_SYMBOL_SETTINGS;
+        if (!beeping && t->tm_sec >= 40 && t->tm_sec < 50)
+        {
+          lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getWiFiSSID().c_str());
+          lv_label_set_text_fmt(datelabel, "http://%s", WiFi.localIP().toString().c_str());
+        }
       }
     }
 
