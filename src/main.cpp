@@ -558,12 +558,13 @@ void loop()
     int warn = 0;
 
     String warning_text = "";
+    int warn_sec = display_now % 30;
 
     if (WiFi.status() != WL_CONNECTED)
     {
       warning_text += LV_SYMBOL_WIFI;
       warn = 1;
-      if (!beeping && t->tm_sec >= 10 && t->tm_sec < 20)
+      if (!beeping && warn_sec >= 5 && warn_sec < 10)
       {
         lv_label_set_text_fmt(alarmlabel, "%s Wi-Fi Disconnected", alarm_prefix.c_str());
       }
@@ -573,13 +574,13 @@ void loop()
     {
       warning_text += LV_SYMBOL_REFRESH;
       warn = 1;
-      if (!beeping && t->tm_sec >= 20 && t->tm_sec < 30)
+      if (!beeping && warn_sec >= 10 && warn_sec < 15)
       {
         lv_label_set_text_fmt(alarmlabel, "%s no recent NTP sync", alarm_prefix.c_str());
       }
     }
 
-    if (warn == 0 && now - last_fetched > 60 * 60)
+    if (warn == 0 && (now - last_fetched > 60 * 60))
     {
       try_fetch();
     }
@@ -588,7 +589,7 @@ void loop()
     {
       warning_text += LV_SYMBOL_BELL;
       warn = 1;
-      if (!beeping && t->tm_sec >= 30 && t->tm_sec < 40)
+      if (!beeping && warn_sec >= 15 && warn_sec < 20)
       {
         lv_label_set_text_fmt(alarmlabel, "%s no recent iCal sync", alarm_prefix.c_str());
       }
@@ -608,7 +609,7 @@ void loop()
       else
       {
         warning_text += LV_SYMBOL_SETTINGS;
-        if (!beeping && t->tm_sec >= 40 && t->tm_sec < 50)
+        if (!beeping && warn_sec >= 20 && warn_sec < 25)
         {
           lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getWiFiSSID().c_str());
           lv_label_set_text_fmt(datelabel, "http://%s", WiFi.localIP().toString().c_str());
