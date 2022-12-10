@@ -6,13 +6,16 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <esp_sntp.h>
+#include <esp_https_ota.h>
+#include <esp_crt_bundle.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <climits>
 #include <uICal.h>
 #include <uICAL/veventiter.h>
 #include <tuple>
 
-//#define ALARM_FREQ 500
+#define OTA_URL "https://time.enslaves.us/ota/from/1/new.img"
+
 #define ALARM_FREQ 1046
 
 TTGOClass *ttgo;
@@ -25,7 +28,9 @@ time_t last_success;
 time_t last_touch;
 time_t last_alarm;
 time_t next_alarm;
+time_t last_ota_attempt;
 int want_stop = 0;
+int ota_ready = 0;
 
 #define MAX_OFFSETS 4
 #define MAX_ALARMS 100
@@ -69,7 +74,7 @@ void time_synced(struct timeval *tv)
   Serial.println("rtc set");
 }
 
-void andevent(arduino_event_id_t event)
+void ardevent(arduino_event_id_t event)
 {
   if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED)
   {
@@ -121,7 +126,7 @@ void saveParamsCallback()
   want_stop = 1;
 }
 
-TaskHandle_t beeptask;
+TaskHandle_t beeptask, otatask;
 
 #define BEEP_ON 250
 #define BEEP_OFF 350
@@ -151,6 +156,29 @@ void beep(void *)
     beeping = 0;
 
     ticked = 1;
+  }
+}
+
+void ota(void *)
+{
+  while (1)
+  {
+    vTaskSuspend(NULL);
+    last_ota_attempt = time(NULL);
+    esp_http_client_config_t http_config = {
+        .url = OTA_URL,
+       .use_global_ca_store = true,
+    };
+    
+    if (!ota_ready)
+    {
+      esp_err_t ret = esp_https_ota(&http_config);
+      if (ret == ESP_OK)
+      {
+        Serial.print("ota ready");
+        ota_ready = 1;
+      }
+    }
   }
 }
 
@@ -234,6 +262,7 @@ void setup()
 
   ledcAttachPin(33, 1);
   xTaskCreate(beep, "beep", 1024, NULL, tskIDLE_PRIORITY, &beeptask);
+  xTaskCreate(ota, "ota", 4096, NULL, tskIDLE_PRIORITY, &otatask);
 
   // Check if RTC is online
   time_t now = 1643768522; // super twosday
@@ -312,7 +341,7 @@ void setup()
   ttgo->button->setLongClickHandler(longclicked);
 
   WiFi.mode(WIFI_STA);
-  WiFi.onEvent(andevent);
+  WiFi.onEvent(ardevent);
   // wifiManager.resetSettings();
   wifiManager.addParameter(&feed_url);
   wifiManager.setConfigPortalBlocking(false);
@@ -569,8 +598,17 @@ void loop()
         lv_label_set_text_fmt(alarmlabel, "%s Wi-Fi Disconnected", alarm_prefix.c_str());
       }
     }
+    else
+    {
+      if (!beeping && last_synced != 0 && 
+          now - last_ota_attempt > 86400 &&
+          (next_alarm == 0 || next_alarm - now > 3600))
+      {
+        vTaskResume(otatask);
+      }
+    }
 
-    if (now - last_synced > (3600 * 2))
+    if (now - last_synced > ((sntp_get_sync_interval() * 4) / 1000))
     {
       warning_text += LV_SYMBOL_REFRESH;
       warn = 1;
@@ -624,6 +662,15 @@ void loop()
         lv_label_set_text_fmt(alarmlabel, "%s SSID: %s", alarm_prefix.c_str(), wifiManager.getConfigPortalSSID().c_str());
         lv_label_set_text_fmt(datelabel, "http://%s", WiFi.softAPIP().toString().c_str());
         warning_text = "";
+      }
+    }
+
+    if (ota_ready)
+    {
+      warning_text += LV_SYMBOL_DOWNLOAD;
+      if (!beeping && warn_sec >= 20 && warn_sec < 25)
+      {
+        lv_label_set_text_fmt(alarmlabel, "%s reboot to update", alarm_prefix.c_str());
       }
     }
 
