@@ -3,11 +3,11 @@
 #include "lvgl/lvgl.h"
 #include <WiFi.h>
 #include "time.h"
-#include <HTTPClient.h>
 #include <Preferences.h>
 #include <esp_sntp.h>
 #include <esp_https_ota.h>
 #include <esp_crt_bundle.h>
+#include <HTTPClient.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <climits>
 #include <uICal.h>
@@ -165,13 +165,14 @@ void ota(void *)
   {
     vTaskSuspend(NULL);
     last_ota_attempt = time(NULL);
-    esp_http_client_config_t http_config = {
-        .url = OTA_URL,
-       .use_global_ca_store = true,
-    };
     
     if (!ota_ready)
     {
+    esp_http_client_config_t http_config = {
+        .url = OTA_URL,    
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };   
+
       esp_err_t ret = esp_https_ota(&http_config);
       if (ret == ESP_OK)
       {
@@ -262,7 +263,7 @@ void setup()
 
   ledcAttachPin(33, 1);
   xTaskCreate(beep, "beep", 1024, NULL, tskIDLE_PRIORITY, &beeptask);
-  xTaskCreate(ota, "ota", 4096, NULL, tskIDLE_PRIORITY, &otatask);
+  xTaskCreate(ota, "ota", 8192, NULL, tskIDLE_PRIORITY, &otatask);
 
   // Check if RTC is online
   time_t now = 1643768522; // super twosday
@@ -287,7 +288,8 @@ void setup()
         .tm_hour = rtcnow.hour,
         .tm_mday = rtcnow.day,
         .tm_mon = rtcnow.month - 1,
-        .tm_year = rtcnow.year - 1900};
+        .tm_year = rtcnow.year - 1900,
+    };
     now = mktime(&t);
     if (now == -1)
     {
@@ -413,7 +415,6 @@ void try_fetch()
       }
       state.offsets[offsets].start = std::get<0>(next_offset);
       state.offsets[offsets].offset = std::get<1>(next_offset);
-    std:
       std::get<2>(next_offset).getBytes(state.offsets[offsets].buffer, sizeof(state.offsets[0].buffer) - 1);
       ++offsets;
     }
@@ -600,7 +601,7 @@ void loop()
     }
     else
     {
-      if (!beeping && last_synced != 0 && 
+      if (!beeping && last_synced != 0 &&
           now - last_ota_attempt > 86400 &&
           (next_alarm == 0 || next_alarm - now > 3600))
       {
