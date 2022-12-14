@@ -7,6 +7,8 @@
 #include <esp_sntp.h>
 #include <esp_https_ota.h>
 #include <esp_crt_bundle.h>
+#include <esp_ota_ops.h>
+#include <esp_timer.h>
 #include <HTTPClient.h>
 #include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <climits>
@@ -14,9 +16,8 @@
 #include <uICAL/veventiter.h>
 #include <tuple>
 
-#define OTA_URL "https://time.enslaves.us/ota/from/1/new.img"
-
 #define ALARM_FREQ 1046
+#define US_IN_SEC 1000000
 
 TTGOClass *ttgo;
 
@@ -53,6 +54,8 @@ struct
   time_t alarm_skip;
   char feed_url[256];
 } state;
+
+SemaphoreHandle_t stateMutex;
 
 Preferences preferences;
 
@@ -99,15 +102,18 @@ void save_data(const char *location)
     if (memcmp(&state, buf, sizeof(state)) == 0)
     {
       Serial.println(" unchanged");
+      xSemaphoreGive(stateMutex);
       return;
     }
   }
   preferences.putBytes("s", &state, sizeof(state));
   Serial.println(" saved");
+  xSemaphoreGive(stateMutex);
 }
 
 void saveParamsCallback()
 {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
   if (strncmp(feed_url.getValue(), state.feed_url, sizeof(state.feed_url)) != 0)
   {
     if (strlcpy(state.feed_url, feed_url.getValue(), sizeof(state.feed_url)) >= sizeof(state.feed_url))
@@ -123,10 +129,14 @@ void saveParamsCallback()
     }
     save_data("save params callback");
   }
+  else
+  {
+    xSemaphoreGive(stateMutex);
+  }
   want_stop = 1;
 }
 
-TaskHandle_t beeptask, otatask;
+TaskHandle_t beeptask, otatask, fetchtask;
 
 #define BEEP_ON 250
 #define BEEP_OFF 350
@@ -165,18 +175,23 @@ void ota(void *)
   {
     vTaskSuspend(NULL);
     last_ota_attempt = time(NULL);
-    
+
     if (!ota_ready)
     {
-    esp_http_client_config_t http_config = {
-        .url = OTA_URL,    
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };   
+      char buffer[65];
+      esp_ota_get_app_elf_sha256(buffer, sizeof(buffer));
+      char url[128];
+      snprintf(url, sizeof(url), "https://time.enslaves.us/ota/from/%s.img", buffer);
+
+      esp_http_client_config_t http_config = {
+          .url = url,
+          .crt_bundle_attach = esp_crt_bundle_attach,
+      };
 
       esp_err_t ret = esp_https_ota(&http_config);
       if (ret == ESP_OK)
       {
-        Serial.print("ota ready");
+        Serial.println("ota ready");
         ota_ready = 1;
       }
     }
@@ -198,6 +213,7 @@ void clicked()
   {
     Serial.println("new touch");
     last_touch = now;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
     if (next_alarm != state.alarm_skip)
     {
       state.alarm_skip = next_alarm;
@@ -216,14 +232,128 @@ void clicked()
   }
 }
 
+void doubleclicked()
+{
+  if (beeping)
+  {
+    return clicked();
+  }
+  if (wifiManager.getConfigPortalActive() || wifiManager.getWebPortalActive())
+  {
+    want_stop = 1;
+  }
+  else
+  {
+    wifiManager.startWebPortal();
+    want_stop = 0;
+  }
+}
+
 void longclicked()
 {
   if (beeping)
   {
     return clicked();
   }
-  wifiManager.startWebPortal();
-  want_stop = 0;
+  Serial.println("marking invalid");
+  esp_ota_mark_app_invalid_rollback_and_reboot();
+  Serial.println("resetting settings");
+  wifiManager.resetSettings();
+  feed_url.setValue("", 0);
+  saveParamsCallback();
+  esp_restart();
+}
+
+void fetch(void *)
+{
+  while (1)
+  {
+    vTaskSuspend(NULL);
+    last_fetched = time(NULL);
+    if (state.feed_url[0] == 0)
+    {
+      Serial.println("skipping feed fetch; no url");
+      last_success = time(NULL);
+      continue;
+    }
+    HTTPClient https;
+    https.useHTTP10(true);
+
+    if (!https.begin(state.feed_url))
+    {
+      Serial.println("https begin failed");
+      continue;
+    }
+    int httpCode = https.GET();
+
+    if (httpCode != 200)
+    {
+      char buf[128];
+      snprintf(buf, sizeof(buf), "http code: %d", httpCode);
+      Serial.println(buf);
+    }
+    if (httpCode <= 0)
+    {
+      continue;
+    }
+    int entered = 0;
+    uICAL::Calendar_ptr cal = nullptr;
+    try
+    {
+      uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
+      uICAL::istream_Stream istm(https.getStream());
+      cal = uICAL::Calendar::load(istm, [calBegin, calEnd](const uICAL::VEvent &event)
+                                  {
+        vTaskDelay(1);
+        auto ev = uICAL::new_ptr<uICAL::VEvent>(event);
+        auto evIt = uICAL::new_ptr<uICAL::VEventIter>(ev, calBegin, calEnd);
+        return evIt->next(); });
+
+      auto current_offset = cal->tz()->fromUTC(last_fetched);
+
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      entered = 1;
+      state.offsets[0].start = last_fetched;
+      state.offsets[0].offset = std::get<0>(current_offset) - last_fetched;
+      std::get<1>(current_offset).getBytes(state.offsets[0].buffer, sizeof(state.offsets[0].buffer) - 1);
+      int offsets = 1;
+      while (offsets < MAX_OFFSETS)
+      {
+        auto next_offset = cal->tz()->next_transition_UTC(state.offsets[offsets - 1].start);
+        if (std::get<0>(next_offset) == MAX_UICAL_SECONDS)
+        {
+          break;
+        }
+        state.offsets[offsets].start = std::get<0>(next_offset);
+        state.offsets[offsets].offset = std::get<1>(next_offset);
+        std::get<2>(next_offset).getBytes(state.offsets[offsets].buffer, sizeof(state.offsets[0].buffer) - 1);
+        ++offsets;
+      }
+      state.num_offsets = offsets;
+
+      uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
+      int alarm = 0;
+      while (calIt->next() && alarm < MAX_ALARMS)
+      {
+        uICAL::CalendarEntry_ptr entry = calIt->current();
+        state.alarms[alarm].start = entry->start().seconds();
+        entry->summary().getBytes(state.alarms[alarm].name, sizeof(state.alarms[alarm].name) - 1);
+        ++alarm;
+        state.num_alarms = alarm;
+        last_success = time(NULL);
+      }
+    }
+    catch (uICAL::Error ex)
+    {
+      char buf[128];
+      snprintf(buf, sizeof(buf), "%s: %s", ex.message.c_str(), "! Failed loading calendar");
+      Serial.println(buf);
+    }
+    if (entered)
+    {
+      save_data("try fetch");
+    }
+  }
 }
 
 lv_obj_t *timelabel, *datelabel, *alarmlabel, *tzlabel, *amlabel, *pmlabel;
@@ -264,6 +394,8 @@ void setup()
   ledcAttachPin(33, 1);
   xTaskCreate(beep, "beep", 1024, NULL, tskIDLE_PRIORITY, &beeptask);
   xTaskCreate(ota, "ota", 8192, NULL, tskIDLE_PRIORITY, &otatask);
+  xTaskCreate(fetch, "fetch", 8192, NULL, tskIDLE_PRIORITY, &fetchtask);
+  stateMutex = xSemaphoreCreateMutex();
 
   // Check if RTC is online
   time_t now = 1643768522; // super twosday
@@ -340,6 +472,7 @@ void setup()
   lv_obj_set_pos(warninglabel, 480, 289);
 
   ttgo->button->setClickHandler(clicked);
+  ttgo->button->setDoubleClickHandler(doubleclicked);
   ttgo->button->setLongClickHandler(longclicked);
 
   WiFi.mode(WIFI_STA);
@@ -353,93 +486,10 @@ void setup()
   {
     want_stop = 0;
   };
-
   Serial.println("end of setup");
 }
 
 time_t lasttime = 0;
-
-void try_fetch()
-{
-  last_fetched = time(NULL);
-  if (state.feed_url[0] == 0)
-  {
-    Serial.println("skipping feed fetch; no url");
-    last_success = time(NULL);
-    return;
-  }
-  HTTPClient https;
-  https.useHTTP10(true);
-
-  if (!https.begin(state.feed_url))
-  {
-    Serial.println("https begin failed");
-    return;
-  }
-  int httpCode = https.GET();
-
-  if (httpCode != 200)
-  {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "http code: %d", httpCode);
-    Serial.println(buf);
-  }
-  if (httpCode <= 0)
-  {
-    return;
-  }
-
-  uICAL::Calendar_ptr cal = nullptr;
-  try
-  {
-    uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
-    uICAL::istream_Stream istm(https.getStream());
-    cal = uICAL::Calendar::load(istm, [calBegin, calEnd](const uICAL::VEvent &event)
-                                {
-        auto ev = uICAL::new_ptr<uICAL::VEvent>(event);
-        auto evIt = uICAL::new_ptr<uICAL::VEventIter>(ev, calBegin, calEnd);
-        return evIt->next(); });
-
-    auto current_offset = cal->tz()->fromUTC(last_fetched);
-
-    state.offsets[0].start = last_fetched;
-    state.offsets[0].offset = std::get<0>(current_offset) - last_fetched;
-    std::get<1>(current_offset).getBytes(state.offsets[0].buffer, sizeof(state.offsets[0].buffer) - 1);
-    int offsets = 1;
-    while (offsets < MAX_OFFSETS)
-    {
-      auto next_offset = cal->tz()->next_transition_UTC(state.offsets[offsets - 1].start);
-      if (std::get<0>(next_offset) == MAX_UICAL_SECONDS)
-      {
-        break;
-      }
-      state.offsets[offsets].start = std::get<0>(next_offset);
-      state.offsets[offsets].offset = std::get<1>(next_offset);
-      std::get<2>(next_offset).getBytes(state.offsets[offsets].buffer, sizeof(state.offsets[0].buffer) - 1);
-      ++offsets;
-    }
-    state.num_offsets = offsets;
-
-    uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
-    int alarm = 0;
-    while (calIt->next() && alarm < MAX_ALARMS)
-    {
-      uICAL::CalendarEntry_ptr entry = calIt->current();
-      state.alarms[alarm].start = entry->start().seconds();
-      entry->summary().getBytes(state.alarms[alarm].name, sizeof(state.alarms[alarm].name) - 1);
-      ++alarm;
-      state.num_alarms = alarm;
-      last_success = time(NULL);
-    }
-  }
-  catch (uICAL::Error ex)
-  {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s: %s", ex.message.c_str(), "! Failed loading calendar");
-    Serial.println(buf);
-  }
-  save_data("try fetch");
-}
 
 void loop()
 {
@@ -450,6 +500,8 @@ void loop()
     time_t display_now = now;
     time_t alarm_now = now - (now % 60);
     int offset = -1;
+    int need_save = 0;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
     while (offset + 1 < state.num_offsets && state.offsets[offset + 1].start <= now)
     {
       ++offset;
@@ -538,7 +590,7 @@ void loop()
       {
         Serial.printf("unset skip %ld != %ld\n", state.alarm_skip, next_alarm);
         state.alarm_skip = 0;
-        save_data("unset skip");
+        need_save = 1;
       }
       offset = -1;
       while (offset + 1 < state.num_offsets && state.offsets[offset + 1].start <= altime)
@@ -580,9 +632,17 @@ void loop()
       if (state.alarm_skip != 0 && next_alarm != 0)
       {
         state.alarm_skip = next_alarm = 0;
-        save_data("no imminent alarm");
+        need_save = 1;
       }
       lv_label_set_text_static(alarmlabel, "no imminent alarm");
+    }
+    if (need_save)
+    {
+      save_data("loop");
+    }
+    else
+    {
+      xSemaphoreGive(stateMutex);
     }
 
     int warn = 0;
@@ -603,7 +663,8 @@ void loop()
     {
       if (!beeping && last_synced != 0 &&
           now - last_ota_attempt > 86400 &&
-          (next_alarm == 0 || next_alarm - now > 3600))
+          (next_alarm == 0 || next_alarm - now > 3600) &&
+          esp_timer_get_time() > 15 * US_IN_SEC)
       {
         vTaskResume(otatask);
       }
@@ -619,9 +680,9 @@ void loop()
       }
     }
 
-    if (warn == 0 && (now - last_fetched > 60 * 60))
+    if (warn == 0 && (now - last_fetched > 60 * 60) && esp_timer_get_time() > 30 * US_IN_SEC)
     {
-      try_fetch();
+      vTaskResume(fetchtask);
     }
 
     if (now - last_success > (3600 * 4))
