@@ -329,6 +329,10 @@ void fetch(void *)
         std::get<2>(next_offset).getBytes(state.offsets[offsets].buffer, sizeof(state.offsets[0].buffer) - 1);
         ++offsets;
       }
+
+      if (offsets == 1 && state.offsets[0].offset == 0 && state.offsets[0].buffer[0] == 'Z' && state.offsets[0].buffer[1] == 0) {
+        offsets = 0;
+      } 
       state.num_offsets = offsets;
 
       uICAL::CalendarIter_ptr calIt = uICAL::new_ptr<uICAL::CalendarIter>(cal, calBegin, calEnd);
