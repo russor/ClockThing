@@ -150,7 +150,7 @@ void beep(void *)
     int pwm = 10;
     beeping = 1;
     ticked = 1;
-    int maxcount = 59000 / (BEEP_ON + BEEP_OFF); // beep for 59 seconds
+    int maxcount = 299000 / (BEEP_ON + BEEP_OFF); // beep for 299 seconds
     while (touched == 0 && --maxcount)
     {
       ledcWrite(1, pwm);
