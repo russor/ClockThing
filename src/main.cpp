@@ -264,8 +264,13 @@ void longclicked()
   esp_restart();
 }
 
+
+extern const uint8_t fallback_timezones[] asm("_binary_fallback_timezones_ics_start");
+
 void fetch(void *)
 {
+
+
   while (1)
   {
     vTaskSuspend(NULL);
@@ -297,12 +302,21 @@ void fetch(void *)
       continue;
     }
     int entered = 0;
-    uICAL::Calendar_ptr cal = nullptr;
+    
+
     try
     {
+
+    uICAL::TZMap_ptr tzmap = uICAL::new_ptr<uICAL::TZMap>();
+    uICAL::Calendar_ptr cal = nullptr;
+
+      String fallback_str((char *)fallback_timezones);
+      uICAL::istream_String fallback(fallback_str);
+      cal = uICAL::Calendar::load(fallback, tzmap);
+
       uICAL::DateTime calBegin(last_fetched), calEnd(last_fetched + 86400 * 7);
       uICAL::istream_Stream istm(https.getStream());
-      cal = uICAL::Calendar::load(istm, [calBegin, calEnd](const uICAL::VEvent &event)
+      cal = uICAL::Calendar::load(istm, tzmap,[calBegin, calEnd](const uICAL::VEvent &event)
                                   {
         vTaskDelay(1);
         auto ev = uICAL::new_ptr<uICAL::VEvent>(event);
